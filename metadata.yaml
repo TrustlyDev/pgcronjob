@@ -1,0 +1,6 @@
+schemaVersion: 1
+owner: "team-infrastructure"
+platform: unknown
+projects:
+  - name: "pgcronjob"
+    namespace: "trustlyplatform"
