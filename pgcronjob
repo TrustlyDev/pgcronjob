@@ -16,6 +16,14 @@ my @RunConnect      = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'requ
 my @LISTENConnect   = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
 my $LISTENName = 'cron.Dispatch()';
 
+# The LISTEN connection sits idle - no bytes sent or received - for as
+# long as there's nothing to notify about, which can easily exceed an
+# hour. Some network paths (e.g. Envoy's default TCP proxy idle
+# timeout) silently drop connections idle for that long, so we send a
+# no-op on it periodically to keep it classified as active. Comfortably
+# under an hour.
+my $LISTENKeepaliveInterval = 15 * 60;
+
 sub SQL_Run {
     my $ProcessID = shift;
     die "Invalid ProcessID: $ProcessID" unless $ProcessID =~ m/^\d+$/;
@@ -57,6 +65,7 @@ for (;;) {
 $Reset_RunAtTime->execute();
 
 my $LISTENDatabaseHandle;
+my $LISTENLastActivity;
 
 sub ConnectLISTEN {
     if (defined $LISTENDatabaseHandle) {
@@ -65,6 +74,7 @@ sub ConnectLISTEN {
     $LISTENDatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
     $LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $LISTENDatabaseHandle->errstr;
     $Select->add($LISTENDatabaseHandle->{pg_socket});
+    $LISTENLastActivity = time();
     return 1;
 }
 ConnectLISTEN();
@@ -291,6 +301,15 @@ for (;;) {
         # Dispatch() polling above will catch up on its own, but wake up
         # again soon rather than sleeping a full cycle.
         $WakeUpTime = 0;
+    }
+    if ($CurrentTime - $LISTENLastActivity >= $LISTENKeepaliveInterval) {
+        # Re-LISTENing on a channel we're already listening on is a
+        # documented no-op server-side; it just generates enough traffic
+        # on the wire to keep the connection from looking idle.
+        unless (eval { $LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}); $LISTENLastActivity = time(); 1 }) {
+            tprint("LISTEN keepalive failed, reconnecting: $@");
+            ConnectLISTEN();
+        }
     }
     $CurrentTime = time();
     my $MaxSleep = $WakeUpTime - $CurrentTime;
