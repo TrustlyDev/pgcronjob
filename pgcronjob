@@ -56,9 +56,18 @@ for (;;) {
 }
 $Reset_RunAtTime->execute();
 
-my $LISTENDatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
-$LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $LISTENDatabaseHandle->errstr;
-$Select->add($LISTENDatabaseHandle->{pg_socket});
+my $LISTENDatabaseHandle;
+
+sub ConnectLISTEN {
+    if (defined $LISTENDatabaseHandle) {
+        $Select->remove($LISTENDatabaseHandle->{pg_socket});
+    }
+    $LISTENDatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
+    $LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $LISTENDatabaseHandle->errstr;
+    $Select->add($LISTENDatabaseHandle->{pg_socket});
+    return 1;
+}
+ConnectLISTEN();
 
 tprint("PgCronJob is now running");
 
@@ -118,7 +127,11 @@ sub CheckErr {
     my $PgErrStr = $Process->{DatabaseHandle}->errstr;
     my $PgState  = $Process->{DatabaseHandle}->state;
 
-    $Log_Error->execute(
+    # Logging the error must not itself be allowed to take down the
+    # whole daemon, e.g. if the ProcessID has meanwhile disappeared from
+    # cron.Processes (cron.Log_Error's INSERT would then fail its FK
+    # constraint).
+    unless (eval { $Log_Error->execute(
         $ProcessID,
         $Process->{DatabaseHandle}->{pg_pid},
         $PgErr,
@@ -126,7 +139,9 @@ sub CheckErr {
         $PgState,
         "$FileName line $Line",
         $$RetryOnError
-    );
+    ); 1 }) {
+        tprint("Unable to log error for ProcessID $ProcessID, continuing anyway: $@");
+    }
 
     FinishDisconnect($ProcessID);
 
@@ -137,7 +152,12 @@ sub CheckErr {
         $$RunAtTime = time() + $$RetryOnError;
     } else {
         delete $Processes->{$ProcessID};
-        $Disable_Process->execute($ProcessID);
+        # Same reasoning as above: cron.Disable_Process() requires the
+        # ProcessID to still exist, so don't let a failure here be fatal
+        # either - we've already removed it from $Processes above.
+        unless (eval { $Disable_Process->execute($ProcessID); 1 }) {
+            tprint("Unable to disable ProcessID $ProcessID, continuing anyway: $@");
+        }
     }
 
     return 0;
@@ -238,24 +258,39 @@ for (;;) {
             }
         }
     }
-    while (my $NOTIFY = $LISTENDatabaseHandle->pg_notifies) {
-        my ($NOTIFYName, $NOTIFYPID, $NOTIFYPayload) = @$NOTIFY;
-        unless ($NOTIFYName eq $LISTENName && $NOTIFYPayload =~ m/^\d+$/) {
-            die "Unexpected notification $NOTIFYName $NOTIFYPayload";
+    # The LISTEN connection is just a low-latency nice-to-have on top of
+    # the regular polling Dispatch() above, so losing it (e.g. a
+    # transient network blip, or the backend being killed for a
+    # certificate rotation) must not take down the whole daemon - we
+    # just reconnect and keep polling in the meantime.
+    unless (eval {
+        while (my $NOTIFY = $LISTENDatabaseHandle->pg_notifies) {
+            my ($NOTIFYName, $NOTIFYPID, $NOTIFYPayload) = @$NOTIFY;
+            unless ($NOTIFYName eq $LISTENName && $NOTIFYPayload =~ m/^\d+$/) {
+                die "Unexpected notification $NOTIFYName $NOTIFYPayload";
+            }
+            my $ProcessID = $NOTIFYPayload;
+            if (!defined $Processes->{$ProcessID}) {
+                # This could happen because notifications can be delayed
+                # for an arbitrary amount of time.
+                next;
+            }
+            if ($Processes->{$ProcessID}->{RunAtTime} > 0) {
+                $Processes->{$ProcessID}->{RunAtTime} = $CurrentTime;
+                $WakeUpTime = $CurrentTime;
+            } else {
+                $Processes->{$ProcessID}->{RunASAP} = 1;
+                $WakeUpTime = 0;
+            }
         }
-        my $ProcessID = $NOTIFYPayload;
-        if (!defined $Processes->{$ProcessID}) {
-            # This could happen because notifications can be delayed
-            # for an arbitrary amount of time.
-            next;
-        }
-        if ($Processes->{$ProcessID}->{RunAtTime} > 0) {
-            $Processes->{$ProcessID}->{RunAtTime} = $CurrentTime;
-            $WakeUpTime = $CurrentTime;
-        } else {
-            $Processes->{$ProcessID}->{RunASAP} = 1;
-            $WakeUpTime = 0;
-        }
+        1;
+    }) {
+        tprint("LISTEN connection error, reconnecting: $@");
+        ConnectLISTEN();
+        # We may have missed a NOTIFY while reconnecting; the regular
+        # Dispatch() polling above will catch up on its own, but wake up
+        # again soon rather than sleeping a full cycle.
+        $WakeUpTime = 0;
     }
     $CurrentTime = time();
     my $MaxSleep = $WakeUpTime - $CurrentTime;
