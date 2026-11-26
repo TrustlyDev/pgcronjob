@@ -65,6 +65,7 @@ for (;;) {
 $Reset_RunAtTime->execute();
 
 my $LISTENDatabaseHandle;
+my $LISTENSocketFD;
 my $LISTENLastActivity;
 my $LISTENLastConnectAttempt;
 my $LISTENReconnectInterval = 10;
@@ -74,7 +75,8 @@ sub ConnectLISTEN {
     my $DatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
     $DatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $DatabaseHandle->errstr;
     $LISTENDatabaseHandle = $DatabaseHandle;
-    $Select->add($LISTENDatabaseHandle->{pg_socket});
+    $LISTENSocketFD = $LISTENDatabaseHandle->{pg_socket};
+    $Select->add($LISTENSocketFD);
     $LISTENLastActivity = time();
     return 1;
 }
@@ -89,8 +91,12 @@ sub ReconnectLISTEN {
     my $Reason = shift;
     tprint("$Reason, reconnecting");
     if (defined $LISTENDatabaseHandle) {
-        $Select->remove($LISTENDatabaseHandle->{pg_socket});
+        # By now libpq may have already closed the socket (e.g. pg_notifies
+        # noticing a dropped connection), making {pg_socket} return -1, so
+        # remove the fd we stored at connect time rather than re-reading it.
+        $Select->remove($LISTENSocketFD);
         $LISTENDatabaseHandle = undef;
+        $LISTENSocketFD = undef;
     }
     unless (eval { ConnectLISTEN(); 1 }) {
         tprint("Unable to reconnect LISTEN database handle, retrying in $LISTENReconnectInterval seconds: $@");
