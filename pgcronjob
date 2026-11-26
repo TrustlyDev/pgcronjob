@@ -13,7 +13,12 @@ $| = 1;
 
 my @DispatchConnect = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
 my @RunConnect      = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 0, PrintError => 0, AutoCommit => 1});
-my @LISTENConnect   = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
+# keepalives_idle/interval/count bound how long the periodic keepalive
+# query below can block the single-threaded main loop if the connection
+# was silently dropped (no FIN/RST, e.g. NAT/firewall idle eviction):
+# without them, a half-open socket only fails after the kernel's TCP
+# retransmission timeout (~15 minutes by default).
+my @LISTENConnect   = ("dbi:Pg:keepalives=1;keepalives_idle=30;keepalives_interval=10;keepalives_count=3", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
 my $LISTENName = 'cron.Dispatch()';
 
 # The LISTEN connection sits idle - no bytes sent or received - for as
@@ -167,6 +172,7 @@ sub CheckErr {
     # whole daemon, e.g. if the ProcessID has meanwhile disappeared from
     # cron.Processes (cron.Log_Error's INSERT would then fail its FK
     # constraint).
+    my $LogErrorFailed;
     unless (eval { $Log_Error->execute(
         $ProcessID,
         $Process->{DatabaseHandle}->{pg_pid},
@@ -176,12 +182,19 @@ sub CheckErr {
         "$FileName line $Line",
         $$RetryOnError
     ); 1 }) {
+        $LogErrorFailed = 1;
         tprint("Unable to log error for ProcessID $ProcessID, continuing anyway: $@ (original error: PgErr=$PgErr PgState=$PgState PgErrStr=$PgErrStr)");
     }
 
     FinishDisconnect($ProcessID);
 
-    if ($PgState eq '40P01') {
+    if ($LogErrorFailed) {
+        # Log_Error's INSERT failing most likely means the ProcessID
+        # above has been deleted from cron.Processes - retrying it or
+        # trying to disable it would just repeat the same failure
+        # forever, so simply drop it from memory.
+        delete $Processes->{$ProcessID};
+    } elsif ($PgState eq '40P01') {
         # deadlock detected, always retry since a deadlock is normal
         $$RunAtTime = time() + 1;
     } elsif (defined $$RetryOnError) {
