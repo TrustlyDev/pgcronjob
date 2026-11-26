@@ -13,8 +13,21 @@ $| = 1;
 
 my @DispatchConnect = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
 my @RunConnect      = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 0, PrintError => 0, AutoCommit => 1});
-my @LISTENConnect   = ("dbi:Pg:", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
+# keepalives_idle/interval/count bound how long the periodic keepalive
+# query below can block the single-threaded main loop if the connection
+# was silently dropped (no FIN/RST, e.g. NAT/firewall idle eviction):
+# without them, a half-open socket only fails after the kernel's TCP
+# retransmission timeout (~15 minutes by default).
+my @LISTENConnect   = ("dbi:Pg:keepalives=1;keepalives_idle=30;keepalives_interval=10;keepalives_count=3", '', '', {pg_enable_utf8 => 1, sslmode => 'require', RaiseError => 1, PrintError => 0, AutoCommit => 1});
 my $LISTENName = 'cron.Dispatch()';
+
+# The LISTEN connection sits idle - no bytes sent or received - for as
+# long as there's nothing to notify about, which can easily exceed an
+# hour. Some network paths (e.g. Envoy's default TCP proxy idle
+# timeout) silently drop connections idle for that long, so we send a
+# no-op on it periodically to keep it classified as active. Comfortably
+# under an hour.
+my $LISTENKeepaliveInterval = 15 * 60;
 
 sub SQL_Run {
     my $ProcessID = shift;
@@ -56,9 +69,46 @@ for (;;) {
 }
 $Reset_RunAtTime->execute();
 
-my $LISTENDatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
-$LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $LISTENDatabaseHandle->errstr;
-$Select->add($LISTENDatabaseHandle->{pg_socket});
+my $LISTENDatabaseHandle;
+my $LISTENSocketFD;
+my $LISTENLastActivity;
+my $LISTENLastConnectAttempt;
+my $LISTENReconnectInterval = 10;
+
+sub ConnectLISTEN {
+    $LISTENLastConnectAttempt = time();
+    my $DatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
+    $DatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $DatabaseHandle->errstr;
+    $LISTENDatabaseHandle = $DatabaseHandle;
+    $LISTENSocketFD = $LISTENDatabaseHandle->{pg_socket};
+    $Select->add($LISTENSocketFD);
+    $LISTENLastActivity = time();
+    return 1;
+}
+ConnectLISTEN();
+
+# The database may still be unreachable when we notice the LISTEN
+# connection is gone, so a failed reconnect must not be fatal either.
+# Leave the handle undefined and let the main loop retry every
+# $LISTENReconnectInterval seconds, relying on Dispatch() polling
+# meanwhile.
+sub ReconnectLISTEN {
+    my $Reason = shift;
+    tprint("$Reason, reconnecting");
+    if (defined $LISTENDatabaseHandle) {
+        # By now libpq may have already closed the socket (e.g. pg_notifies
+        # noticing a dropped connection), making {pg_socket} return -1, so
+        # remove the fd we stored at connect time rather than re-reading it.
+        $Select->remove($LISTENSocketFD);
+        $LISTENDatabaseHandle = undef;
+        $LISTENSocketFD = undef;
+    }
+    unless (eval { ConnectLISTEN(); 1 }) {
+        tprint("Unable to reconnect LISTEN database handle, retrying in $LISTENReconnectInterval seconds: $@");
+        return 0;
+    }
+    return 1;
+}
 
 tprint("PgCronJob is now running");
 
@@ -118,7 +168,12 @@ sub CheckErr {
     my $PgErrStr = $Process->{DatabaseHandle}->errstr;
     my $PgState  = $Process->{DatabaseHandle}->state;
 
-    $Log_Error->execute(
+    # Logging the error must not itself be allowed to take down the
+    # whole daemon, e.g. if the ProcessID has meanwhile disappeared from
+    # cron.Processes (cron.Log_Error's INSERT would then fail its FK
+    # constraint).
+    my $LogErrorFailed;
+    unless (eval { $Log_Error->execute(
         $ProcessID,
         $Process->{DatabaseHandle}->{pg_pid},
         $PgErr,
@@ -126,18 +181,32 @@ sub CheckErr {
         $PgState,
         "$FileName line $Line",
         $$RetryOnError
-    );
+    ); 1 }) {
+        $LogErrorFailed = 1;
+        tprint("Unable to log error for ProcessID $ProcessID, continuing anyway: $@ (original error: PgErr=$PgErr PgState=$PgState PgErrStr=$PgErrStr)");
+    }
 
     FinishDisconnect($ProcessID);
 
-    if ($PgState eq '40P01') {
+    if ($LogErrorFailed) {
+        # Log_Error's INSERT failing most likely means the ProcessID
+        # above has been deleted from cron.Processes - retrying it or
+        # trying to disable it would just repeat the same failure
+        # forever, so simply drop it from memory.
+        delete $Processes->{$ProcessID};
+    } elsif ($PgState eq '40P01') {
         # deadlock detected, always retry since a deadlock is normal
         $$RunAtTime = time() + 1;
     } elsif (defined $$RetryOnError) {
         $$RunAtTime = time() + $$RetryOnError;
     } else {
         delete $Processes->{$ProcessID};
-        $Disable_Process->execute($ProcessID);
+        # Same reasoning as above: cron.Disable_Process() requires the
+        # ProcessID to still exist, so don't let a failure here be fatal
+        # either - we've already removed it from $Processes above.
+        unless (eval { $Disable_Process->execute($ProcessID); 1 }) {
+            tprint("Unable to disable ProcessID $ProcessID, continuing anyway: $@");
+        }
     }
 
     return 0;
@@ -238,23 +307,49 @@ for (;;) {
             }
         }
     }
-    while (my $NOTIFY = $LISTENDatabaseHandle->pg_notifies) {
-        my ($NOTIFYName, $NOTIFYPID, $NOTIFYPayload) = @$NOTIFY;
-        unless ($NOTIFYName eq $LISTENName && $NOTIFYPayload =~ m/^\d+$/) {
-            die "Unexpected notification $NOTIFYName $NOTIFYPayload";
-        }
-        my $ProcessID = $NOTIFYPayload;
-        if (!defined $Processes->{$ProcessID}) {
-            # This could happen because notifications can be delayed
-            # for an arbitrary amount of time.
-            next;
-        }
-        if ($Processes->{$ProcessID}->{RunAtTime} > 0) {
-            $Processes->{$ProcessID}->{RunAtTime} = $CurrentTime;
-            $WakeUpTime = $CurrentTime;
-        } else {
-            $Processes->{$ProcessID}->{RunASAP} = 1;
+    # The LISTEN connection is just a low-latency nice-to-have on top of
+    # the regular polling Dispatch() above, so losing it (e.g. a
+    # transient network blip, or the backend being killed for a
+    # certificate rotation) must not take down the whole daemon - we
+    # just reconnect and keep polling in the meantime.
+    if (!defined $LISTENDatabaseHandle) {
+        if ($CurrentTime - $LISTENLastConnectAttempt >= $LISTENReconnectInterval && ReconnectLISTEN("LISTEN connection is down")) {
             $WakeUpTime = 0;
+        }
+    } elsif (!eval {
+        while (my $NOTIFY = $LISTENDatabaseHandle->pg_notifies) {
+            my ($NOTIFYName, $NOTIFYPID, $NOTIFYPayload) = @$NOTIFY;
+            unless ($NOTIFYName eq $LISTENName && $NOTIFYPayload =~ m/^\d+$/) {
+                die "Unexpected notification $NOTIFYName $NOTIFYPayload";
+            }
+            my $ProcessID = $NOTIFYPayload;
+            if (!defined $Processes->{$ProcessID}) {
+                # This could happen because notifications can be delayed
+                # for an arbitrary amount of time.
+                next;
+            }
+            if ($Processes->{$ProcessID}->{RunAtTime} > 0) {
+                $Processes->{$ProcessID}->{RunAtTime} = $CurrentTime;
+                $WakeUpTime = $CurrentTime;
+            } else {
+                $Processes->{$ProcessID}->{RunASAP} = 1;
+                $WakeUpTime = 0;
+            }
+        }
+        1;
+    }) {
+        ReconnectLISTEN("LISTEN connection error: $@");
+        # We may have missed a NOTIFY while reconnecting; the regular
+        # Dispatch() polling above will catch up on its own, but wake up
+        # again soon rather than sleeping a full cycle.
+        $WakeUpTime = 0;
+    }
+    if (defined $LISTENDatabaseHandle && $CurrentTime - $LISTENLastActivity >= $LISTENKeepaliveInterval) {
+        # Re-LISTENing on a channel we're already listening on is a
+        # documented no-op server-side; it just generates enough traffic
+        # on the wire to keep the connection from looking idle.
+        unless (eval { $LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}); $LISTENLastActivity = time(); 1 }) {
+            ReconnectLISTEN("LISTEN keepalive failed: $@");
         }
     }
     $CurrentTime = time();
