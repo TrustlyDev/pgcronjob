@@ -66,18 +66,38 @@ $Reset_RunAtTime->execute();
 
 my $LISTENDatabaseHandle;
 my $LISTENLastActivity;
+my $LISTENLastConnectAttempt;
+my $LISTENReconnectInterval = 10;
 
 sub ConnectLISTEN {
-    if (defined $LISTENDatabaseHandle) {
-        $Select->remove($LISTENDatabaseHandle->{pg_socket});
-    }
-    $LISTENDatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
-    $LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $LISTENDatabaseHandle->errstr;
+    $LISTENLastConnectAttempt = time();
+    my $DatabaseHandle = DBI->connect(@LISTENConnect) or die "Unable to connect LISTEN database handle";
+    $DatabaseHandle->do(qq{LISTEN "$LISTENName"}) or die "Unable to LISTEN: " . $DatabaseHandle->errstr;
+    $LISTENDatabaseHandle = $DatabaseHandle;
     $Select->add($LISTENDatabaseHandle->{pg_socket});
     $LISTENLastActivity = time();
     return 1;
 }
 ConnectLISTEN();
+
+# The database may still be unreachable when we notice the LISTEN
+# connection is gone, so a failed reconnect must not be fatal either.
+# Leave the handle undefined and let the main loop retry every
+# $LISTENReconnectInterval seconds, relying on Dispatch() polling
+# meanwhile.
+sub ReconnectLISTEN {
+    my $Reason = shift;
+    tprint("$Reason, reconnecting");
+    if (defined $LISTENDatabaseHandle) {
+        $Select->remove($LISTENDatabaseHandle->{pg_socket});
+        $LISTENDatabaseHandle = undef;
+    }
+    unless (eval { ConnectLISTEN(); 1 }) {
+        tprint("Unable to reconnect LISTEN database handle, retrying in $LISTENReconnectInterval seconds: $@");
+        return 0;
+    }
+    return 1;
+}
 
 tprint("PgCronJob is now running");
 
@@ -150,7 +170,7 @@ sub CheckErr {
         "$FileName line $Line",
         $$RetryOnError
     ); 1 }) {
-        tprint("Unable to log error for ProcessID $ProcessID, continuing anyway: $@");
+        tprint("Unable to log error for ProcessID $ProcessID, continuing anyway: $@ (original error: PgErr=$PgErr PgState=$PgState PgErrStr=$PgErrStr)");
     }
 
     FinishDisconnect($ProcessID);
@@ -273,7 +293,11 @@ for (;;) {
     # transient network blip, or the backend being killed for a
     # certificate rotation) must not take down the whole daemon - we
     # just reconnect and keep polling in the meantime.
-    unless (eval {
+    if (!defined $LISTENDatabaseHandle) {
+        if ($CurrentTime - $LISTENLastConnectAttempt >= $LISTENReconnectInterval && ReconnectLISTEN("LISTEN connection is down")) {
+            $WakeUpTime = 0;
+        }
+    } elsif (!eval {
         while (my $NOTIFY = $LISTENDatabaseHandle->pg_notifies) {
             my ($NOTIFYName, $NOTIFYPID, $NOTIFYPayload) = @$NOTIFY;
             unless ($NOTIFYName eq $LISTENName && $NOTIFYPayload =~ m/^\d+$/) {
@@ -295,20 +319,18 @@ for (;;) {
         }
         1;
     }) {
-        tprint("LISTEN connection error, reconnecting: $@");
-        ConnectLISTEN();
+        ReconnectLISTEN("LISTEN connection error: $@");
         # We may have missed a NOTIFY while reconnecting; the regular
         # Dispatch() polling above will catch up on its own, but wake up
         # again soon rather than sleeping a full cycle.
         $WakeUpTime = 0;
     }
-    if ($CurrentTime - $LISTENLastActivity >= $LISTENKeepaliveInterval) {
+    if (defined $LISTENDatabaseHandle && $CurrentTime - $LISTENLastActivity >= $LISTENKeepaliveInterval) {
         # Re-LISTENing on a channel we're already listening on is a
         # documented no-op server-side; it just generates enough traffic
         # on the wire to keep the connection from looking idle.
         unless (eval { $LISTENDatabaseHandle->do(qq{LISTEN "$LISTENName"}); $LISTENLastActivity = time(); 1 }) {
-            tprint("LISTEN keepalive failed, reconnecting: $@");
-            ConnectLISTEN();
+            ReconnectLISTEN("LISTEN keepalive failed: $@");
         }
     }
     $CurrentTime = time();
